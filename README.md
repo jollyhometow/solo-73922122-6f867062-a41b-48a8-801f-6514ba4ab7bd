@@ -19,6 +19,14 @@
   4. 同一事务内把已入仓读数重新关联到新段，提交前再校验无孤儿事实；
   5. 任何一步失败整体回滚，原归属与事实表保持不变。
 - **按产线取数**：只可能读到已完整提交的读数及其归属（READ COMMITTED + 单事务原子写）。
+- **覆盖审计 (coverage audit)**：核对一条产线的电表定时采样是否完整。给定产线、
+  UTC 窗口 `[start, end)` 和期望采样间隔 `interval_seconds`，从**窗口起点**生成期望时刻
+  （start, start+step, …，严格小于 end），并裁剪到每块电表当前归属该产线的时段——
+  电表只在归属该产线期间才有采样义务。返回每块电表的期望/实际/缺失计数、合并后的
+  **缺失区间**（`[interval_from, interval_to)` 右开，含缺失点数），以及**同一电表同一时刻
+  有多条读数**的重复清单（电表、时刻、条数）。整个审计的三条查询跑在**同一个
+  REPEATABLE READ 事务**里，即同一数据库快照：并发的归属修正或批量入仓要么整体可见、
+  要么整体不可见，绝不混合前后两个提交状态。
 
 ### 并发正确性如何保证
 
@@ -52,8 +60,11 @@
 | POST | `/readings/ingest` | 批量入仓读数；任一缺归属则整批拒收 |
 | POST | `/ownership/correct` | 凭 `base_version` 修正窗口归属并重关联读数 |
 | GET  | `/readings/by-line/{line}` | 按产线查询已提交读数（支持 start/end/limit） |
+| GET  | `/audit/coverage/{line}` | 覆盖审计：期望时刻 vs 已入仓读数，返回缺失区间与重复读数 |
 
-错误码：404 电表未登记；409 重叠/版本冲突/读数编号重复；422 无归属、窗口含缺口、时间区间非法。
+审计参数：`start`/`end`（UTC，左闭右开）、`interval_seconds`（期望采样间隔，正整数秒）。
+错误码：404 电表未登记；409 重叠/版本冲突/读数编号重复；422 无归属、窗口含缺口、
+时间区间非法、采样间隔非正、审计网格超上限（默认 100 万点/表，`AUDIT_MAX_GRID_POINTS` 可调）。
 
 ## 4. 用 Docker Compose 启动（双实例 + 数据库）
 
@@ -76,6 +87,9 @@ API 实例等数据库就绪后才启动。
 5. `POST /ownership/correct` 带上一步的 `version`，把 `[06:00Z, 18:00Z)` 改成 `LINE-C`。
 6. `GET /readings/by-line/LINE-C` 看到被重新关联的读数；两侧历史仍在 LINE-A / LINE-B。
 7. 用过期的 `base_version` 再修正一次，得到 409。
+8. `GET /audit/coverage/LINE-C?start=2026-01-01T06:00:00Z&end=2026-01-01T18:00:00Z&interval_seconds=3600`
+   审计 LINE-C 的小时级采样：期望时刻按窗口起点生成并裁剪到 `[06:00, 18:00)` 归属段，
+   返回每表期望/实际/缺失计数、合并的缺失区间和重复读数清单。
 
 `scripts/e2e_smoke.sh` 与 `scripts/e2e_dual_instance.py` 把上述流程（含双实例并发竞争）
 脚本化，可直接对运行中的实例执行。
@@ -88,7 +102,7 @@ API 实例等数据库就绪后才启动。
 ./scripts/dev_pg.sh                      # 默认 localhost:5439, 库 meterdb
 export DATABASE_URL=postgresql://node:node@localhost:5439/meterdb
 pip install -r requirements.txt httpx pytest
-pytest tests/                            # 17 个功能 + 并发测试
+pytest tests/                            # 38 个功能、审计与并发测试
 ```
 
 ## 7. 目录结构
@@ -100,9 +114,9 @@ app/
   schema.sql     表、约束、索引、审计表
   errors.py      领域异常 -> HTTP 状态码
   schemas.py     Pydantic 请求/响应模型（UTC 校验）
-  services.py    登记 / 入仓 / 修正 / 查询的事务逻辑
+  services.py    登记 / 入仓 / 修正 / 查询 / 覆盖审计的事务逻辑
   main.py        FastAPI 路由与生命周期
-tests/           功能测试与双连接并发测试（每测试独立 schema）
+tests/           功能测试、覆盖审计测试与双连接并发测试（每测试独立 schema）
 scripts/         本地 PG、HTTP 冒烟与双实例并发脚本
 docker-compose.yml, Dockerfile
 ```

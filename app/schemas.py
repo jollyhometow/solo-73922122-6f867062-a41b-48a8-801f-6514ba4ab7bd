@@ -87,3 +87,39 @@ class VersionedResponse(BaseModel):
 class IngestResponse(BaseModel):
     ingested: int
     readings: list[ReadingOut]
+
+
+class AuditMeterSummary(BaseModel):
+    meter_no: str
+    expected: int = Field(description="scheduled instants inside this meter's "
+                                      "segments on the audited line")
+    present: int = Field(description="readings currently attributed to the "
+                                     "line inside the window")
+    missing: int = Field(description="scheduled instants with no reading")
+
+
+class AuditMissingInterval(BaseModel):
+    meter_no: str
+    interval_from: datetime = Field(
+        description="first missing scheduled instant of the run")
+    interval_to: datetime = Field(
+        description="right-open end: last missing instant + interval_seconds")
+    missing_count: int
+
+
+class AuditDuplicate(BaseModel):
+    meter_no: str
+    ts: datetime
+    count: int = Field(description="readings at this instant (>1)")
+
+
+class CoverageAuditResponse(BaseModel):
+    line: str
+    window_start: datetime
+    window_end: datetime
+    interval_seconds: int
+    expected_total: int
+    missing_total: int
+    meters: list[AuditMeterSummary]
+    missing_intervals: list[AuditMissingInterval]
+    duplicates: list[AuditDuplicate]

@@ -87,3 +87,29 @@ def db_conn(test_schema):
     with psycopg.connect(os.environ["DATABASE_URL"]) as conn:
         conn.execute("SET lock_timeout = '5s'")
         yield conn
+
+
+@pytest.fixture()
+def connection_factory(test_schema):
+    """Factory returning a fresh, thread-private connection.
+
+    Mirrors how two uvicorn instances reach the same database: each worker
+    gets its own connection (a connection is not thread-safe).
+    """
+    base = os.environ["DATABASE_URL"].split("?")[0]
+    created: list[psycopg.Connection] = []
+
+    def make():
+        c = psycopg.connect(base)
+        c.cursor().execute(f"SET search_path TO {test_schema}")
+        c.cursor().execute("SET lock_timeout = '10s'")
+        c.commit()
+        created.append(c)
+        return c
+
+    yield make
+    for c in created:
+        try:
+            c.close()
+        except psycopg.Error:
+            pass

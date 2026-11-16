@@ -31,6 +31,10 @@ class Settings:
         return int(os.getenv("QUERY_LIMIT_MAX", "1000"))
 
     @property
+    def audit_max_grid_points(self) -> int:
+        return int(os.getenv("AUDIT_MAX_GRID_POINTS", "1000000"))
+
+    @property
     def init_schema(self) -> bool:
         return os.getenv("INIT_SCHEMA", "1") != "0"
 

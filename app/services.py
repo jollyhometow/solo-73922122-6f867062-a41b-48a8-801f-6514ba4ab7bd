@@ -7,11 +7,13 @@ because both instances talk to the same PostgreSQL database.
 """
 from __future__ import annotations
 
+import math
 from datetime import datetime
 
 from psycopg import Connection
 from psycopg.errors import CheckViolation, ExclusionViolation, UniqueViolation
 
+from .config import settings
 from .errors import ConflictError, NotFoundError, UnprocessableError
 
 
@@ -423,3 +425,184 @@ def query_readings_by_line(
         cur.execute(" ".join(sql), params)
         cols = [d.name for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Coverage audit
+# ---------------------------------------------------------------------------
+#
+# The audit answers: "did every meter of this line produce a reading at every
+# scheduled instant?" Expected instants are generated from the window start
+# (start, start+step, ... strictly before end) and clipped to each meter's
+# current ownership segments on the audited line: a meter is only expected to
+# sample while it belongs to that line.
+#
+# All audit statements share one CTE stack and run inside a single
+# REPEATABLE READ transaction, so every row they read comes from the same
+# database snapshot. A correction or batch ingestion committing concurrently
+# is either fully visible or fully invisible to the whole audit -- never a
+# mix of pre- and post-commit state. (A read-only REPEATABLE READ transaction
+# cannot hit serialization failures, so no retry loop is needed.)
+
+_AUDIT_CTES = """
+WITH grid AS (
+    -- Scheduled instants anchored at the window start, right-open window.
+    SELECT gs AS ts
+    FROM generate_series(
+        %(start)s::timestamptz,
+        %(end)s::timestamptz,
+        %(step)s * interval '1 second'
+    ) AS gs
+    WHERE gs < %(end)s::timestamptz
+),
+expected AS (
+    -- Scheduled instants falling inside a current ownership segment of the
+    -- audited line. Live segments of one meter never overlap (GiST exclusion
+    -- constraint), so each instant matches at most one segment.
+    SELECT o.meter_no, g.ts
+    FROM ownership o
+    JOIN grid g
+      ON g.ts >= o.valid_from AND g.ts < o.valid_to
+    WHERE o.line = %(line)s
+      AND o.valid_from < %(end)s
+      AND o.valid_to >  %(start)s
+),
+actual AS (
+    -- Readings currently attributed to the audited line, grouped per
+    -- (meter, ts) so duplicate readings at the same instant stay visible.
+    SELECT r.meter_no, r.ts, count(*) AS n
+    FROM reading r
+    JOIN ownership o ON o.id = r.ownership_id
+    WHERE o.line = %(line)s
+      AND r.ts >= %(start)s
+      AND r.ts <  %(end)s
+    GROUP BY r.meter_no, r.ts
+)
+"""
+
+_SQL_AUDIT_SUMMARY = _AUDIT_CTES + """
+, exp_agg AS (
+    SELECT meter_no, count(*) AS expected FROM expected GROUP BY meter_no
+),
+act_agg AS (
+    SELECT meter_no, sum(n) AS present FROM actual GROUP BY meter_no
+),
+miss_agg AS (
+    SELECT e.meter_no, count(*) AS missing
+    FROM expected e
+    LEFT JOIN actual a ON a.meter_no = e.meter_no AND a.ts = e.ts
+    WHERE a.ts IS NULL
+    GROUP BY e.meter_no
+)
+SELECT m.meter_no,
+       coalesce(ea.expected, 0) AS expected,
+       coalesce(aa.present,  0) AS present,
+       coalesce(ma.missing,  0) AS missing
+FROM (SELECT meter_no FROM exp_agg
+      UNION
+      SELECT meter_no FROM act_agg) m
+LEFT JOIN exp_agg  ea USING (meter_no)
+LEFT JOIN act_agg  aa USING (meter_no)
+LEFT JOIN miss_agg ma USING (meter_no)
+ORDER BY m.meter_no
+"""
+
+_SQL_AUDIT_MISSING = _AUDIT_CTES + """
+, missing AS (
+    SELECT e.meter_no, e.ts
+    FROM expected e
+    LEFT JOIN actual a ON a.meter_no = e.meter_no AND a.ts = e.ts
+    WHERE a.ts IS NULL
+),
+islands AS (
+    -- Gaps-and-islands: instants on a uniform grid share
+    -- ts - row_number()*step within each run of consecutive misses.
+    SELECT meter_no, ts,
+           ts - row_number() OVER (PARTITION BY meter_no ORDER BY ts)
+                  * (%(step)s * interval '1 second') AS grp
+    FROM missing
+)
+SELECT meter_no,
+       min(ts)                                        AS interval_from,
+       max(ts) + %(step)s * interval '1 second'       AS interval_to,
+       count(*)                                       AS missing_count
+FROM islands
+GROUP BY meter_no, grp
+ORDER BY meter_no, interval_from
+"""
+
+_SQL_AUDIT_DUPLICATES = _AUDIT_CTES + """
+SELECT meter_no, ts, n AS cnt
+FROM actual
+WHERE n > 1
+ORDER BY meter_no, ts
+"""
+
+
+def audit_coverage(
+    conn: Connection,
+    line: str,
+    start: datetime,
+    end: datetime,
+    interval_seconds: int,
+) -> dict:
+    """Audit scheduled-sampling coverage for one production line.
+
+    Returns per-meter expected/present/missing counts, the missing instants
+    merged into [from, to) intervals, and duplicate (meter, ts) readings.
+    Everything is read from one REPEATABLE READ snapshot (see module notes
+    above), so the report always reflects exactly one committed state of the
+    warehouse even while corrections and ingestions commit concurrently.
+    """
+    if start >= end:
+        raise UnprocessableError("start must be strictly before end")
+    if interval_seconds <= 0:
+        raise UnprocessableError("interval_seconds must be a positive integer")
+    grid_points = math.ceil(
+        (end - start).total_seconds() / interval_seconds
+    )
+    if grid_points > settings.audit_max_grid_points:
+        raise UnprocessableError(
+            f"audit would generate {grid_points} scheduled instants per "
+            f"meter; the limit is {settings.audit_max_grid_points} - "
+            "narrow the window or increase interval_seconds"
+        )
+    params = {"line": line, "start": start, "end": end,
+              "step": interval_seconds}
+    with conn.transaction():
+        cur = conn.cursor()
+        # Must be the first statement of the transaction: pins every
+        # subsequent statement to one consistent snapshot.
+        cur.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+
+        cur.execute(_SQL_AUDIT_SUMMARY, params)
+        meters = [
+            {"meter_no": r[0], "expected": r[1], "present": r[2],
+             "missing": r[3]}
+            for r in cur.fetchall()
+        ]
+
+        cur.execute(_SQL_AUDIT_MISSING, params)
+        missing_intervals = [
+            {"meter_no": r[0], "interval_from": r[1], "interval_to": r[2],
+             "missing_count": r[3]}
+            for r in cur.fetchall()
+        ]
+
+        cur.execute(_SQL_AUDIT_DUPLICATES, params)
+        duplicates = [
+            {"meter_no": r[0], "ts": r[1], "count": r[2]}
+            for r in cur.fetchall()
+        ]
+
+    return {
+        "line": line,
+        "window_start": start,
+        "window_end": end,
+        "interval_seconds": interval_seconds,
+        "expected_total": sum(m["expected"] for m in meters),
+        "missing_total": sum(m["missing"] for m in meters),
+        "meters": meters,
+        "missing_intervals": missing_intervals,
+        "duplicates": duplicates,
+    }

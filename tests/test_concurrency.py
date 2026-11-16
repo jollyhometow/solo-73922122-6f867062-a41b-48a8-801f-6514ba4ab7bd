@@ -7,39 +7,15 @@ optimistic meter version, all enforced inside PostgreSQL.
 """
 from __future__ import annotations
 
-import os
 import threading
 from datetime import datetime, timedelta, timezone
 
-import psycopg
 import pytest
 
 from app import services
 
 UTC = timezone.utc
 T0 = datetime(2026, 6, 1, tzinfo=UTC)
-
-
-@pytest.fixture()
-def connection_factory(test_schema):
-    """Factory returning a fresh, thread-private connection."""
-    base = os.environ["DATABASE_URL"].split("?")[0]
-    created: list[psycopg.Connection] = []
-
-    def make():
-        c = psycopg.connect(base)
-        c.cursor().execute(f"SET search_path TO {test_schema}")
-        c.cursor().execute("SET lock_timeout = '10s'")
-        c.commit()
-        created.append(c)
-        return c
-
-    yield make
-    for c in created:
-        try:
-            c.close()
-        except psycopg.Error:
-            pass
 
 
 def _current_version(conn, meter):

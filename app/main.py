@@ -15,9 +15,10 @@ from fastapi.responses import JSONResponse
 from . import services
 from .config import settings
 from .db import close_pool, init_pool
-from .errors import AppError
+from .errors import AppError, UnprocessableError
 from .schemas import (
     CorrectRequest,
+    CoverageAuditResponse,
     IngestRequest,
     IngestResponse,
     MeterOut,
@@ -122,3 +123,32 @@ def by_line(
     limit = min(limit, settings.query_limit_max)
     rows = services.query_readings_by_line(c, line, start, end, limit)
     return [ReadingOut(**r) for r in rows]
+
+
+def _aware_utc(dt: datetime, name: str) -> datetime:
+    """Reject naive datetimes and normalize aware ones to UTC."""
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        raise UnprocessableError(f"{name} must carry a timezone (UTC)")
+    return dt.astimezone(timezone.utc)
+
+
+@app.get("/audit/coverage/{line}", response_model=CoverageAuditResponse,
+         tags=["audit"],
+         summary="Audit scheduled-sampling coverage of a line's meters")
+def audit_coverage(
+    line: str,
+    c=Depends(conn),
+    start: datetime = Query(..., description="window start, UTC, inclusive"),
+    end: datetime = Query(..., description="window end, UTC, exclusive"),
+    interval_seconds: int = Query(
+        ..., gt=0, description="expected sampling interval, seconds"),
+) -> CoverageAuditResponse:
+    """Expected instants are generated from the window start and clipped to
+    each meter's ownership segments on the line. The whole audit reads one
+    REPEATABLE READ snapshot, so concurrent corrections/ingestions are seen
+    either completely or not at all."""
+    start = _aware_utc(start, "start")
+    end = _aware_utc(end, "end")
+    return CoverageAuditResponse(
+        **services.audit_coverage(c, line, start, end, interval_seconds)
+    )
