@@ -1,0 +1,45 @@
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: meterdb
+      POSTGRES_PASSWORD: meterdb
+      POSTGRES_DB: meterdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U meterdb -d meterdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api1:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://meterdb:meterdb@db:5432/meterdb
+      POOL_MIN_SIZE: "2"
+      POOL_MAX_SIZE: "10"
+    ports:
+      - "8001:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api2:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://meterdb:meterdb@db:5432/meterdb
+      POOL_MIN_SIZE: "2"
+      POOL_MAX_SIZE: "10"
+    ports:
+      - "8002:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
